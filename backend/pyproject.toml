@@ -1,0 +1,30 @@
+[project]
+name = "wechat-travel-agents-backend"
+version = "0.1.0"
+description = "FastAPI backend for multi-agent WeChat article generation"
+requires-python = ">=3.14"
+dependencies = [
+  "apscheduler>=3.11.0",
+  "fastapi>=0.116.0",
+  "httpx>=0.28.0",
+  "langchain>=0.3.20",
+  "langchain-anthropic>=0.3.18",
+  "langchain-google-genai>=2.1.5",
+  "langchain-openai>=0.3.17",
+  "langgraph>=0.3.5",
+  "playwright>=1.54.0",
+  "pydantic-settings>=2.8.0",
+  "python-dotenv>=1.0.1",
+  "sqlmodel>=0.0.24",
+  "uvicorn>=0.35.0",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3.5",
+  "ruff>=0.11.4",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"

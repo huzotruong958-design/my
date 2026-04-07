@@ -1,0 +1,15 @@
+services:
+  xiaohongshu-mcp:
+    image: xpzouying/xiaohongshu-mcp
+    container_name: wechat-xiaohongshu-mcp
+    restart: unless-stopped
+    init: true
+    tty: true
+    environment:
+      - ROD_BROWSER_BIN=/usr/bin/google-chrome
+      - COOKIES_PATH=/app/data/cookies.json
+    volumes:
+      - ../../.runtime/xiaohongshu-mcp/data:/app/data
+      - ../../.runtime/xiaohongshu-mcp/images:/app/images
+    ports:
+      - "18060:18060"
