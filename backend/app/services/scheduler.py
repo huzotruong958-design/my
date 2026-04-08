@@ -142,7 +142,8 @@ class SchedulerService:
             session.add(replay)
             session.commit()
             session.refresh(replay)
-            return workflow_service.run_job(session, replay)
+            workflow_service.submit_job_by_id(replay.id or 0)
+            return replay
 
     def list_schedule_runtime(self) -> list[dict]:
         with Session(engine) as session:

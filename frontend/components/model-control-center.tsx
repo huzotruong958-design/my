@@ -23,6 +23,33 @@ type AgentConfig = {
   enabled: boolean;
 };
 
+type ContentStrategy = {
+  config: {
+    departure_city: string;
+    transport_mode: string;
+    max_transport_hours: number;
+    trip_day_count: number;
+    trip_nights: number;
+    no_repeat_months: number;
+    persona_brief: string;
+    hard_constraints: string;
+    blacklist: string[];
+    seasonal_guidance: string;
+    title_rules: string;
+    structure_rules: string;
+    style_rules: string;
+    carry_goods_rules: string;
+  };
+  recent_destinations: string[];
+  manual_blacklist: string[];
+  auto_blacklist: string[];
+  destination_history: Array<{
+    destination: string;
+    selected_at: string;
+    job_id?: number;
+  }>;
+};
+
 const agentLabels: Record<string, string> = {
   researcher: "素材采集者",
   fact_checker: "信息校验者",
@@ -37,16 +64,16 @@ const defaults: Record<string, Omit<AgentConfig, "agent_type">> = {
   researcher: {
     provider: "gemini",
     credential_id: null,
-    model_name: "gemini-2.5-pro",
+    model_name: "gemini-3-flash-preview",
     temperature: 0.2,
     max_tokens: 3000,
     timeout_seconds: 60,
     enabled: true,
   },
   fact_checker: {
-    provider: "openai-compatible",
+    provider: "gemini",
     credential_id: null,
-    model_name: "gpt-4.1-mini",
+    model_name: "gemini-3-flash-preview",
     temperature: 0.1,
     max_tokens: 2000,
     timeout_seconds: 60,
@@ -55,25 +82,25 @@ const defaults: Record<string, Omit<AgentConfig, "agent_type">> = {
   writer: {
     provider: "gemini",
     credential_id: null,
-    model_name: "gemini-2.5-pro",
+    model_name: "gemini-3-pro-preview",
     temperature: 0.7,
     max_tokens: 4500,
     timeout_seconds: 90,
     enabled: true,
   },
   formatter: {
-    provider: "anthropic",
+    provider: "gemini",
     credential_id: null,
-    model_name: "claude-3-7-sonnet",
+    model_name: "gemini-3-flash-preview",
     temperature: 0.2,
     max_tokens: 2000,
     timeout_seconds: 60,
     enabled: true,
   },
   editor: {
-    provider: "openai-compatible",
+    provider: "gemini",
     credential_id: null,
-    model_name: "gpt-4.1-mini",
+    model_name: "gemini-3-flash-preview",
     temperature: 0.2,
     max_tokens: 1500,
     timeout_seconds: 60,
@@ -82,7 +109,7 @@ const defaults: Record<string, Omit<AgentConfig, "agent_type">> = {
   image_editor: {
     provider: "gemini",
     credential_id: null,
-    model_name: "gemini-2.5-pro",
+    model_name: "gemini-3-flash-preview",
     temperature: 0.3,
     max_tokens: 2000,
     timeout_seconds: 90,
@@ -103,10 +130,12 @@ export function ModelControlCenter({
   providers,
   credentials,
   configs,
+  contentStrategy,
 }: {
   providers: Provider[];
   credentials: Credential[];
   configs: AgentConfig[];
+  contentStrategy: ContentStrategy;
 }) {
   const [credentialForm, setCredentialForm] = useState({
     provider: "gemini",
@@ -116,7 +145,12 @@ export function ModelControlCenter({
   });
   const [credentialResult, setCredentialResult] = useState("");
   const [configResult, setConfigResult] = useState("");
+  const [strategyResult, setStrategyResult] = useState("");
   const [pending, startTransition] = useTransition();
+  const [strategyForm, setStrategyForm] = useState({
+    ...contentStrategy.config,
+    blacklist_text: contentStrategy.config.blacklist.join("\n"),
+  });
 
   const initialRows = useMemo(() => {
     return Object.entries(agentLabels).map(([agentType, label]) => {
@@ -147,6 +181,167 @@ export function ModelControlCenter({
 
   return (
     <div className="stack">
+      <div className="panel stack">
+        <div>
+          <div className="eyebrow">Content Strategy</div>
+          <h3 style={{ marginBottom: 8 }}>旅行写作策略与目的地去重</h3>
+          <p className="muted">这里控制 researcher / writer 等角色共享的出发城市、交通时限、黑名单和目的地冷却周期。</p>
+        </div>
+        <div className="grid">
+          <label>
+            出发城市
+            <input
+              value={strategyForm.departure_city}
+              onChange={(e) => setStrategyForm({ ...strategyForm, departure_city: e.target.value })}
+            />
+          </label>
+          <label>
+            交通方式
+            <input
+              value={strategyForm.transport_mode}
+              onChange={(e) => setStrategyForm({ ...strategyForm, transport_mode: e.target.value })}
+            />
+          </label>
+          <label>
+            最长交通时长
+            <input
+              value={strategyForm.max_transport_hours}
+              onChange={(e) => setStrategyForm({ ...strategyForm, max_transport_hours: Number(e.target.value) })}
+            />
+          </label>
+          <label>
+            行程天数
+            <input
+              value={strategyForm.trip_day_count}
+              onChange={(e) => setStrategyForm({ ...strategyForm, trip_day_count: Number(e.target.value) })}
+            />
+          </label>
+          <label>
+            住宿夜数
+            <input
+              value={strategyForm.trip_nights}
+              onChange={(e) => setStrategyForm({ ...strategyForm, trip_nights: Number(e.target.value) })}
+            />
+          </label>
+          <label>
+            去重周期（月）
+            <input
+              value={strategyForm.no_repeat_months}
+              onChange={(e) => setStrategyForm({ ...strategyForm, no_repeat_months: Number(e.target.value) })}
+            />
+          </label>
+        </div>
+        <label>
+          人设说明
+          <textarea
+            rows={4}
+            value={strategyForm.persona_brief}
+            onChange={(e) => setStrategyForm({ ...strategyForm, persona_brief: e.target.value })}
+          />
+        </label>
+        <label>
+          硬性约束
+          <textarea
+            rows={4}
+            value={strategyForm.hard_constraints}
+            onChange={(e) => setStrategyForm({ ...strategyForm, hard_constraints: e.target.value })}
+          />
+        </label>
+        <label>
+          黑名单
+          <textarea
+            rows={8}
+            value={strategyForm.blacklist_text}
+            onChange={(e) => setStrategyForm({ ...strategyForm, blacklist_text: e.target.value })}
+            placeholder="每行一个地点"
+          />
+        </label>
+        <label>
+          季节引导
+          <textarea
+            rows={3}
+            value={strategyForm.seasonal_guidance}
+            onChange={(e) => setStrategyForm({ ...strategyForm, seasonal_guidance: e.target.value })}
+          />
+        </label>
+        <label>
+          标题规则
+          <textarea
+            rows={3}
+            value={strategyForm.title_rules}
+            onChange={(e) => setStrategyForm({ ...strategyForm, title_rules: e.target.value })}
+          />
+        </label>
+        <label>
+          结构规则
+          <textarea
+            rows={3}
+            value={strategyForm.structure_rules}
+            onChange={(e) => setStrategyForm({ ...strategyForm, structure_rules: e.target.value })}
+          />
+        </label>
+        <label>
+          风格规则
+          <textarea
+            rows={3}
+            value={strategyForm.style_rules}
+            onChange={(e) => setStrategyForm({ ...strategyForm, style_rules: e.target.value })}
+          />
+        </label>
+        <label>
+          特产/带货规则
+          <textarea
+            rows={3}
+            value={strategyForm.carry_goods_rules}
+            onChange={(e) => setStrategyForm({ ...strategyForm, carry_goods_rules: e.target.value })}
+          />
+        </label>
+        <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <button
+            type="button"
+            onClick={() =>
+              startTransition(async () => {
+                const response = await fetch("http://localhost:8000/api/models/content-strategy", {
+                  method: "PUT",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    ...strategyForm,
+                    blacklist: strategyForm.blacklist_text
+                      .split("\n")
+                      .map((item) => item.trim())
+                      .filter(Boolean),
+                  }),
+                });
+                const payload = await response.json();
+                setStrategyResult(JSON.stringify(payload, null, 2));
+              })
+            }
+          >
+            {pending ? "保存中..." : "保存内容策略"}
+          </button>
+          <span className="muted">researcher 会自动避开最近 {strategyForm.no_repeat_months} 个月已用过的目的地。</span>
+        </div>
+        {strategyResult ? <pre style={{ whiteSpace: "pre-wrap", margin: 0 }}>{strategyResult}</pre> : null}
+        <div className="panel" style={{ padding: 16 }}>
+          <div className="eyebrow">Blacklists</div>
+          <p className="muted">
+            手工黑名单：{contentStrategy.manual_blacklist.length ? contentStrategy.manual_blacklist.join("、") : "暂无"}
+          </p>
+          <p className="muted">
+            自动黑名单：{contentStrategy.auto_blacklist.length ? contentStrategy.auto_blacklist.join("、") : "暂无"}
+          </p>
+        </div>
+        <div className="panel" style={{ padding: 16 }}>
+          <div className="eyebrow">Recent Destinations</div>
+          <p className="muted">
+            最近冷却中的目的地：{contentStrategy.recent_destinations.length ? contentStrategy.recent_destinations.join("、") : "暂无"}
+          </p>
+          <pre style={{ whiteSpace: "pre-wrap", margin: 0 }}>
+            {JSON.stringify(contentStrategy.destination_history, null, 2)}
+          </pre>
+        </div>
+      </div>
+
       <div className="panel stack">
         <div>
           <div className="eyebrow">Credentials</div>
@@ -370,4 +565,3 @@ export function ModelControlCenter({
     </div>
   );
 }
-

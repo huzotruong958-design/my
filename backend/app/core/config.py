@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     app_env: str = "development"
     database_url: str = "sqlite:///./wechat_agents.db"
     jwt_secret: str = "replace-me"
+    app_encryption_key: str = ""
     wechat_component_app_id: str = ""
     wechat_component_app_secret: str = ""
     wechat_component_token: str = ""

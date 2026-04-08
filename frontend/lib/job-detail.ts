@@ -30,6 +30,22 @@ export function executionModeLabel(mode: string | undefined) {
   return "Mock 占位";
 }
 
+export function agentLabel(agentName: string | undefined) {
+  if (!agentName) return "未开始";
+  return agentLabels[agentName] ?? agentName;
+}
+
+export function formatDuration(seconds: number | null | undefined) {
+  if (seconds == null) return "-";
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  if (minutes < 60) return `${minutes}m ${remainingSeconds}s`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return `${hours}h ${remainingMinutes}m`;
+}
+
 export function resolvePublishPreview(preview: PublishPreviewDetail | undefined) {
   return {
     publishReadiness: preview?.publish_readiness ?? {},

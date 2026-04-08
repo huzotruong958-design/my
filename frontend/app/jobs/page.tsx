@@ -1,10 +1,25 @@
 import Link from "next/link";
 
 import { apiGet } from "@/lib/api";
+import { agentLabel, formatDuration } from "@/lib/job-detail";
 import { CreateJobForm } from "@/components/create-job-form";
 
+type JobsPageItem = {
+  id: number;
+  destination: string;
+  start_date: string;
+  end_date: string;
+  status: string;
+  timing?: {
+    current_step?: string;
+    running_seconds?: number;
+    completed_step_count?: number;
+    total_step_count?: number;
+  };
+};
+
 export default async function JobsPage() {
-  const jobs = await apiGet<any[]>("/jobs");
+  const jobs = await apiGet<JobsPageItem[]>("/jobs");
   return (
     <div className="stack">
       <div className="hero">
@@ -27,6 +42,10 @@ export default async function JobsPage() {
             </div>
             <div className="muted">
               {job.start_date} 至 {job.end_date}
+            </div>
+            <div className="muted">
+              当前步骤：{agentLabel(job.timing?.current_step)} · 已运行 {formatDuration(job.timing?.running_seconds)} ·
+              进度 {job.timing?.completed_step_count ?? 0}/{job.timing?.total_step_count ?? 0}
             </div>
             <div>
               <Link className="button secondary" href={`/jobs/${job.id}`}>

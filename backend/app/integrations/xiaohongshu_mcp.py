@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import httpx
@@ -71,7 +72,7 @@ class XiaohongshuMcpClient:
                 "num": limit,
             },
         )
-        return self.call_tool(tool["name"], args)
+        return self._call_tool_with_retry(tool["name"], args, attempts=3)
 
     def get_note_detail(self, item: dict[str, Any]) -> dict[str, Any]:
         tools = self._list_tools()
@@ -90,17 +91,39 @@ class XiaohongshuMcpClient:
                 "url": item.get("url") or item.get("link"),
             },
         )
-        return self.call_tool(tool["name"], args)
+        return self._call_tool_with_retry(tool["name"], args, attempts=2)
 
-    def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    def call_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        timeout_seconds: int | None = None,
+    ) -> dict[str, Any]:
         result = self._rpc(
             "tools/call",
             {
                 "name": tool_name,
                 "arguments": {k: v for k, v in arguments.items() if v not in (None, "")},
             },
+            timeout_seconds=timeout_seconds,
         )
         return self._normalize_tool_result(result)
+
+    def _call_tool_with_retry(self, tool_name: str, arguments: dict[str, Any], *, attempts: int) -> dict[str, Any]:
+        last_error: Exception | None = None
+        base_timeout = max(10, int(self.timeout_seconds or 30))
+        for attempt in range(1, attempts + 1):
+            try:
+                attempt_timeout = min(base_timeout, max(10, int(base_timeout * (0.55 + (attempt - 1) * 0.25))))
+                return self.call_tool(tool_name, arguments, timeout_seconds=attempt_timeout)
+            except (httpx.TimeoutException, httpx.TransportError, RuntimeError) as exc:
+                last_error = exc
+                self._initialized = False
+                self.session_id = ""
+                if attempt >= attempts:
+                    break
+                time.sleep(1.5 * attempt)
+        raise RuntimeError(f"{tool_name} failed after {attempts} attempts: {last_error}") from last_error
 
     def _list_tools(self) -> list[dict[str, Any]]:
         self._initialize()
@@ -168,7 +191,7 @@ class XiaohongshuMcpClient:
         except Exception:
             return {"text": joined}
 
-    def _rpc(self, method: str, params: dict[str, Any]) -> Any:
+    def _rpc(self, method: str, params: dict[str, Any], timeout_seconds: int | None = None) -> Any:
         body = {"jsonrpc": "2.0", "id": self._rpc_id, "method": method, "params": params}
         self._rpc_id += 1
         headers = {"Content-Type": "application/json"}
@@ -179,7 +202,13 @@ class XiaohongshuMcpClient:
                 headers[self.auth_header] = self.api_token
         if self.session_id:
             headers["mcp-session-id"] = self.session_id
-        with httpx.Client(timeout=self.timeout_seconds, follow_redirects=True) as client:
+        request_timeout = timeout_seconds or self.timeout_seconds
+        timeout = httpx.Timeout(
+            connect=min(10, request_timeout),
+            read=request_timeout,
+            write=min(10, request_timeout),
+        )
+        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
             response = client.post(self.endpoint, json=body, headers=headers)
             response.raise_for_status()
             session_id = response.headers.get("mcp-session-id", "")

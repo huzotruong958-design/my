@@ -1,5 +1,5 @@
 import json
-
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -11,22 +11,117 @@ from app.models.entities import ArticleJob, JobStep, MediaAsset, PublishRecord, 
 from app.schemas.common import JobReplayPayload, PublishExecutePayload, TravelRequest
 from app.services.app_settings import app_settings_service
 from app.services.image_pipeline import image_pipeline_service
+from app.services.secrets import secrets_service
 from app.services.scheduler import scheduler_service
 from app.services.workflow import workflow_service
 
 router = APIRouter()
 
+WORKFLOW_STEPS = [
+    "researcher",
+    "writer",
+    "fact_checker",
+    "formatter",
+    "editor",
+    "image_editor",
+    "publisher",
+]
+
+
+def _utc_now() -> datetime:
+    return datetime.utcnow()
+
+
+def _duration_seconds(start: datetime | None, end: datetime | None) -> int:
+    if not start or not end:
+        return 0
+    return max(0, int((end - start).total_seconds()))
+
+
+def _job_timing_payload(
+    job: ArticleJob,
+    steps: list[JobStep],
+    publish: PublishRecord | None = None,
+) -> dict:
+    last_step = steps[-1] if steps else None
+    started_at = job.created_at
+    latest_event_at = max(
+        [item for item in [job.created_at, last_step.created_at if last_step else None, publish.created_at if publish else None] if item],
+        default=job.created_at,
+    )
+    finished = job.status in {"succeeded", "failed"}
+    finished_at = latest_event_at if finished else None
+    elapsed_until = finished_at or _utc_now()
+    current_step = ""
+    current_step_status = ""
+    next_step = ""
+    if job.status == "pending":
+        next_step = WORKFLOW_STEPS[0]
+    elif job.status == "running":
+        if last_step and last_step.status == "failed":
+            current_step = last_step.agent_name
+            current_step_status = "failed"
+        elif last_step:
+            current_index = WORKFLOW_STEPS.index(last_step.agent_name) if last_step.agent_name in WORKFLOW_STEPS else -1
+            if current_index >= 0 and current_index + 1 < len(WORKFLOW_STEPS):
+                current_step = WORKFLOW_STEPS[current_index + 1]
+                current_step_status = "running"
+                next_step = WORKFLOW_STEPS[current_index + 2] if current_index + 2 < len(WORKFLOW_STEPS) else ""
+            else:
+                current_step = last_step.agent_name or WORKFLOW_STEPS[-1]
+                current_step_status = "running"
+        else:
+            current_step = WORKFLOW_STEPS[0]
+            current_step_status = "running"
+            next_step = WORKFLOW_STEPS[1]
+    elif job.status == "succeeded":
+        current_step = WORKFLOW_STEPS[-1] if steps else ""
+        current_step_status = "succeeded"
+    elif job.status == "failed":
+        current_step = last_step.agent_name if last_step else ""
+        current_step_status = last_step.status if last_step else "failed"
+
+    return {
+        "started_at": started_at.isoformat() if started_at else "",
+        "last_event_at": latest_event_at.isoformat() if latest_event_at else "",
+        "finished_at": finished_at.isoformat() if finished_at else "",
+        "running_seconds": _duration_seconds(started_at, elapsed_until),
+        "completed_seconds": _duration_seconds(started_at, finished_at) if finished_at else None,
+        "current_step": current_step,
+        "current_step_status": current_step_status,
+        "next_step": next_step,
+        "completed_step_count": len([step for step in steps if step.status == "succeeded"]),
+        "total_step_count": len(WORKFLOW_STEPS),
+    }
+
 
 @router.get("")
 def list_jobs(session: Session = Depends(get_session)):
     statement = select(ArticleJob).order_by(ArticleJob.id.desc())
-    return session.exec(statement).all()
+    jobs = session.exec(statement).all()
+    payload: list[dict] = []
+    for job in jobs:
+        steps = session.exec(
+            select(JobStep).where(JobStep.article_job_id == (job.id or 0)).order_by(JobStep.id.asc())
+        ).all()
+        publish = session.exec(
+            select(PublishRecord).where(PublishRecord.article_job_id == (job.id or 0))
+        ).first()
+        payload.append(
+            {
+                **job.model_dump(),
+                "timing": _job_timing_payload(job, steps, publish),
+            }
+        )
+    return payload
 
 
 @router.post("/travel/generate-and-publish")
 def generate_and_publish(payload: TravelRequest, session: Session = Depends(get_session)):
     job = workflow_service.create_job(session, payload)
-    return workflow_service.run_job(session, job)
+    workflow_service.submit_job_by_id(job.id or 0)
+    session.refresh(job)
+    return job
 
 
 def _media_url(request: Request, local_path: str) -> str:
@@ -137,6 +232,7 @@ def get_job(job_id: int, request: Request, session: Session = Depends(get_sessio
     publish_record = _serialize_publish_record(publish)
     return {
         "job": job,
+        "timing": _job_timing_payload(job, steps, publish),
         "steps": steps,
         "publish_record": publish_record,
         "publish_result": _extract_publish_result(publish_record, parsed_output),
@@ -196,7 +292,9 @@ def refresh_job_images(job_id: int, session: Session = Depends(get_session)):
     image_editor["result"]["image_asset_pack"] = image_pack
     image_editor["result"]["provider_context"] = {
         "provider": image_pack.get("provider", ""),
-        "manifest_count": len(app_settings_service.get_external_image_manifest(session)),
+        "image_count": image_pack.get("image_count", 0),
+        "raw_image_count": image_pack.get("raw_image_count", image_pack.get("image_count", 0)),
+        "source_note_count": image_pack.get("note_count", 0),
     }
     image_editor["result"]["slot_assignments"] = slot_assignments
     parsed_output["image_editor"] = image_editor
@@ -260,7 +358,9 @@ def execute_publish(
         select(WeChatAuthorization).where(WeChatAuthorization.official_account_id == job.official_account_id)
     ).first()
     authorizer_access_token = (
-        auth.authorizer_access_token if auth and auth.authorizer_access_token else "mock-authorizer-access-token"
+        secrets_service.decrypt_if_needed(auth.authorizer_access_token)
+        if auth and auth.authorizer_access_token
+        else "mock-authorizer-access-token"
     )
     authorization_mode = workflow_service._authorization_mode(auth)
     publish_payload = workflow_service._build_publish_payload(parsed_output)

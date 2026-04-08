@@ -12,6 +12,7 @@ from app.schemas.common import (
     ComponentCallbackMockPayload,
     ComponentTicketPayload,
 )
+from app.services.secrets import secrets_service
 
 router = APIRouter()
 
@@ -24,7 +25,7 @@ def serialize_authorization(auth: WeChatAuthorization | None) -> dict | None:
         "authorizer_app_id": auth.authorizer_app_id,
         "expires_at": auth.expires_at,
         "updated_at": auth.updated_at,
-        "has_refresh_token": bool(auth.authorizer_refresh_token),
+        "has_refresh_token": bool(secrets_service.decrypt_if_needed(auth.authorizer_refresh_token)),
     }
 
 
@@ -167,15 +168,16 @@ def get_account_publish_context(account_id: int, session: Session = Depends(get_
     authorization_mode = "missing"
     refresh_request = None
     if auth:
-        raw_payload = auth.raw_payload or ""
+        raw_payload = secrets_service.decrypt_if_needed(auth.raw_payload)
+        access_token = secrets_service.decrypt_if_needed(auth.authorizer_access_token)
         authorization_mode = (
             "mock"
-            if "mock-authorize" in raw_payload or auth.authorizer_access_token.startswith("mock-")
+            if "mock-authorize" in raw_payload or access_token.startswith("mock-")
             else "third_party_platform"
         )
         refresh_request = wechat_integration.build_authorizer_token_refresh_request(
             authorizer_appid=auth.authorizer_app_id,
-            authorizer_refresh_token=auth.authorizer_refresh_token,
+            authorizer_refresh_token=secrets_service.decrypt_if_needed(auth.authorizer_refresh_token),
         )
     return {
         "account_id": account.id,
@@ -229,17 +231,17 @@ def wechat_auth_callback(
         auth = WeChatAuthorization(
             official_account_id=account.id,
             authorizer_app_id=payload["authorizer_app_id"],
-            authorizer_access_token=payload["authorizer_access_token"],
-            authorizer_refresh_token=payload["authorizer_refresh_token"],
+            authorizer_access_token=secrets_service.encrypt_if_needed(payload["authorizer_access_token"]),
+            authorizer_refresh_token=secrets_service.encrypt_if_needed(payload["authorizer_refresh_token"]),
             expires_at=datetime.fromisoformat(payload["expires_at"]),
-            raw_payload=json.dumps(payload, ensure_ascii=False),
+            raw_payload=secrets_service.encrypt_if_needed(json.dumps(payload, ensure_ascii=False)),
         )
     else:
         auth.authorizer_app_id = payload["authorizer_app_id"]
-        auth.authorizer_access_token = payload["authorizer_access_token"]
-        auth.authorizer_refresh_token = payload["authorizer_refresh_token"]
+        auth.authorizer_access_token = secrets_service.encrypt_if_needed(payload["authorizer_access_token"])
+        auth.authorizer_refresh_token = secrets_service.encrypt_if_needed(payload["authorizer_refresh_token"])
         auth.expires_at = datetime.fromisoformat(payload["expires_at"])
-        auth.raw_payload = json.dumps(payload, ensure_ascii=False)
+        auth.raw_payload = secrets_service.encrypt_if_needed(json.dumps(payload, ensure_ascii=False))
         auth.updated_at = datetime.utcnow()
     session.add(auth)
     session.commit()
@@ -254,18 +256,20 @@ def refresh_account_status(account_id: int, session: Session = Depends(get_sessi
     ).first()
     if not account or not auth:
         return {"ok": False, "message": "Account authorization not found"}
-    raw_payload = auth.raw_payload or ""
-    if "mock-authorize" in raw_payload or auth.authorizer_access_token.startswith("mock-"):
-        refreshed = wechat_integration.refresh_authorization(auth.authorizer_refresh_token)
+    raw_payload = secrets_service.decrypt_if_needed(auth.raw_payload)
+    access_token = secrets_service.decrypt_if_needed(auth.authorizer_access_token)
+    refresh_token = secrets_service.decrypt_if_needed(auth.authorizer_refresh_token)
+    if "mock-authorize" in raw_payload or access_token.startswith("mock-"):
+        refreshed = wechat_integration.refresh_authorization(refresh_token)
     else:
         refreshed = wechat_integration.refresh_authorization_live(
             session,
             authorizer_appid=auth.authorizer_app_id,
-            authorizer_refresh_token=auth.authorizer_refresh_token,
+            authorizer_refresh_token=refresh_token,
         )
-    auth.authorizer_access_token = refreshed["authorizer_access_token"]
+    auth.authorizer_access_token = secrets_service.encrypt_if_needed(refreshed["authorizer_access_token"])
     if refreshed.get("authorizer_refresh_token"):
-        auth.authorizer_refresh_token = refreshed["authorizer_refresh_token"]
+        auth.authorizer_refresh_token = secrets_service.encrypt_if_needed(refreshed["authorizer_refresh_token"])
     auth.expires_at = datetime.fromisoformat(refreshed["expires_at"])
     auth.updated_at = datetime.utcnow()
     account.publishable = True
@@ -290,10 +294,10 @@ def mock_authorize_account(account_id: int, session: Session = Depends(get_sessi
         auth = WeChatAuthorization(
             official_account_id=account_id,
             authorizer_app_id=account.wechat_app_id,
-            authorizer_access_token="mock-access-token",
-            authorizer_refresh_token="mock-refresh-token",
+            authorizer_access_token=secrets_service.encrypt_if_needed("mock-access-token"),
+            authorizer_refresh_token=secrets_service.encrypt_if_needed("mock-refresh-token"),
             expires_at=datetime.utcnow(),
-            raw_payload=json.dumps({"source": "mock-authorize"}),
+            raw_payload=secrets_service.encrypt_if_needed(json.dumps({"source": "mock-authorize"})),
         )
 
     account.publishable = True

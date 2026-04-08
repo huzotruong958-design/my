@@ -1,6 +1,9 @@
 "use client";
 
 import { useState, useTransition } from "react";
+import Link from "next/link";
+
+const apiBase = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 const initialState = {
   tenant_id: 1,
@@ -15,6 +18,7 @@ const initialState = {
 export function CreateJobForm() {
   const [form, setForm] = useState(initialState);
   const [result, setResult] = useState<string>("");
+  const [createdJobId, setCreatedJobId] = useState<number | null>(null);
   const [pending, startTransition] = useTransition();
 
   return (
@@ -80,22 +84,28 @@ export function CreateJobForm() {
           type="button"
           onClick={() =>
             startTransition(async () => {
-              const response = await fetch("http://localhost:8000/api/jobs/travel/generate-and-publish", {
+              const response = await fetch(`${apiBase}/api/jobs/travel/generate-and-publish`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(form),
               });
               const payload = await response.json();
+              setCreatedJobId(typeof payload?.id === "number" ? payload.id : null);
               setResult(JSON.stringify(payload, null, 2));
             })
           }
         >
-          {pending ? "生成中..." : "生成任务"}
+          {pending ? "提交中..." : "生成任务"}
         </button>
-        <span className="muted">会调用后端 LangGraph 工作流并写入任务记录。</span>
+        <span className="muted">会创建任务并在后台执行 LangGraph 工作流。</span>
       </div>
+      {createdJobId ? (
+        <div className="muted">
+          已创建任务 #{createdJobId}，
+          <Link href={`/jobs/${createdJobId}`}>查看任务详情</Link>
+        </div>
+      ) : null}
       {result ? <pre style={{ whiteSpace: "pre-wrap", margin: 0 }}>{result}</pre> : null}
     </div>
   );
 }
-

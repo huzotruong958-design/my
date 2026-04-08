@@ -109,6 +109,19 @@ export type ParsedJobOutputs = {
   image_editor?: ImageEditorOutput;
 };
 
+export type JobTimingDetail = {
+  started_at: string;
+  last_event_at: string;
+  finished_at: string;
+  running_seconds: number;
+  completed_seconds: number | null;
+  current_step: string;
+  current_step_status: string;
+  next_step: string;
+  completed_step_count: number;
+  total_step_count: number;
+};
+
 export type JobDetail = {
   job: {
     id: number;
@@ -118,6 +131,7 @@ export type JobDetail = {
     status: string;
     error_message?: string;
   };
+  timing: JobTimingDetail;
   steps: JobStepDetail[];
   publish_record: PublishRecordDetail | null;
   publish_result: Record<string, unknown>;

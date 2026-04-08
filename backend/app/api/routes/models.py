@@ -6,7 +6,9 @@ from sqlmodel import Session, delete, select
 
 from app.db.session import get_session
 from app.models.entities import AgentModelConfig, ModelCredential
-from app.schemas.common import AgentModelConfigPayload, CredentialPayload
+from app.schemas.common import AgentModelConfigPayload, ContentStrategyPayload, CredentialPayload
+from app.services.app_settings import app_settings_service
+from app.services.secrets import secrets_service
 
 router = APIRouter()
 
@@ -14,7 +16,7 @@ router = APIRouter()
 def serialize_credential(credential: ModelCredential) -> dict:
     masked = ""
     if credential.api_key_encrypted:
-        key = credential.api_key_encrypted
+        key = secrets_service.decrypt_if_needed(credential.api_key_encrypted)
         masked = f"{key[:4]}...{key[-4:]}" if len(key) > 8 else "****"
     return {
         "id": credential.id,
@@ -55,7 +57,7 @@ def create_credential(
         tenant_id=tenant_id,
         provider=payload.provider,
         label=payload.label,
-        api_key_encrypted=payload.api_key,
+        api_key_encrypted=secrets_service.encrypt_if_needed(payload.api_key),
         base_url=payload.base_url or "",
         status="validated",
         last_validated_at=datetime.utcnow(),
@@ -138,3 +140,27 @@ def model_readiness(tenant_id: int, session: Session = Depends(get_session)):
         "configured_agents": [item.agent_type for item in configs if item.enabled],
         "ready_for_real_llm": any(item.status == "validated" for item in credentials),
     }
+
+
+@router.get("/content-strategy")
+def get_content_strategy(session: Session = Depends(get_session)):
+    config = app_settings_service.get_content_strategy_config(session)
+    history = app_settings_service.get_destination_history(session)
+    recent = app_settings_service.refresh_auto_destination_blacklist(
+        session,
+        months=int(config.get("no_repeat_months") or 3),
+    )
+    return {
+        "config": config,
+        "recent_destinations": recent,
+        "manual_blacklist": app_settings_service.get_manual_blacklist(session),
+        "auto_blacklist": app_settings_service.get_auto_destination_blacklist(session),
+        "destination_history": history[:20],
+    }
+
+
+@router.put("/content-strategy")
+def save_content_strategy(payload: ContentStrategyPayload, session: Session = Depends(get_session)):
+    config = payload.model_dump()
+    app_settings_service.set_content_strategy_config(session, config)
+    return get_content_strategy(session)

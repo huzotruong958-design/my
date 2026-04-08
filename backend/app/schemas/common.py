@@ -154,3 +154,20 @@ class AgentProbePayload(BaseModel):
         "publisher",
     ]
     state: dict[str, Any] = Field(default_factory=dict)
+
+
+class ContentStrategyPayload(BaseModel):
+    departure_city: str = "郑州"
+    transport_mode: str = "自驾"
+    max_transport_hours: float = 3
+    trip_day_count: int = 2
+    trip_nights: int = 1
+    no_repeat_months: int = 3
+    persona_brief: str = ""
+    hard_constraints: str = ""
+    blacklist: list[str] = Field(default_factory=list)
+    seasonal_guidance: str = ""
+    title_rules: str = ""
+    structure_rules: str = ""
+    style_rules: str = ""
+    carry_goods_rules: str = ""

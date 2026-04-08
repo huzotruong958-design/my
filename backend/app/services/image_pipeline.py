@@ -298,13 +298,17 @@ class XiaohongshuNoteScrapeProvider:
             article_context=article_context,
         )
         assets: list[GeneratedAsset] = []
-        with httpx.Client(timeout=30, follow_redirects=True, headers=self._headers()) as client:
+        note_count = int(preview.get("note_count") or 0)
+        raw_image_count = int(preview.get("raw_image_count") or preview.get("image_count") or 0)
+        selected_image_count = int(preview.get("image_count") or 0)
+        with httpx.Client(timeout=20, follow_redirects=True, headers=self._headers()) as client:
             for index, image in enumerate(preview["images"][:10], start=1):
                 image_url = str(image.get("image_url") or "")
                 if not image_url:
                     continue
-                response = client.get(image_url)
-                response.raise_for_status()
+                response = self._download_image_with_retry(client, image_url)
+                if response is None:
+                    continue
                 tag = str(image.get("tag") or self.default_tag_order[(index - 1) % len(self.default_tag_order)])
                 suffix = self._infer_suffix(str(response.url))
                 image_path = images_dir / f"asset_{index:02d}_{tag}{suffix}"
@@ -323,6 +327,9 @@ class XiaohongshuNoteScrapeProvider:
                             "kind": "xiaohongshu_public_page_image",
                             "caption_hint": f"{destination} {tag} 小红书素材",
                             "note_index": image.get("note_index", 0),
+                            "provider_note_count": note_count,
+                            "provider_raw_image_count": raw_image_count,
+                            "provider_selected_image_count": selected_image_count,
                         },
                     )
                 )
@@ -355,10 +362,11 @@ class XiaohongshuNoteScrapeProvider:
             normalized_urls = discovered_urls
         notes: list[dict] = []
         flattened_images: list[dict] = []
+        raw_image_target = max(10, limit * 3)
         with httpx.Client(timeout=20, follow_redirects=True, headers=self._headers()) as client:
             for note_index, url in enumerate(normalized_urls, start=1):
                 try:
-                    response = client.get(url)
+                    response = client.get(url, timeout=16)
                     response.raise_for_status()
                     html = response.text
                     extracted = self._extract_note_payload(str(response.url), html, note_index)
@@ -387,16 +395,24 @@ class XiaohongshuNoteScrapeProvider:
                                 "note_index": note_index,
                             }
                         )
+                if len(flattened_images) >= raw_image_target:
+                    break
+        selected_images = self._select_images_for_article(
+            images=flattened_images,
+            article_context=article_context or {},
+            max_images=max(limit * 6, 10),
+        )
         return {
             "provider": self.provider_name,
             "discovery_mode": not bool(seed_urls),
             "discovered_seed_urls": discovered_urls,
             "seed_count": len(normalized_urls),
             "note_count": len(notes),
-            "image_count": len(flattened_images),
+            "image_count": len(selected_images),
+            "raw_image_count": len(flattened_images),
             "browser_diagnostics": browser_diagnostics,
             "notes": notes,
-            "images": flattened_images,
+            "images": selected_images,
         }
 
     def discover_seed_urls(
@@ -800,6 +816,120 @@ class XiaohongshuNoteScrapeProvider:
                 return suffix
         return ".jpg"
 
+    def _download_image_with_retry(
+        self,
+        client: httpx.Client,
+        image_url: str,
+    ) -> httpx.Response | None:
+        for attempt in range(1, 4):
+            try:
+                response = client.get(image_url, timeout=12 + attempt * 4)
+                response.raise_for_status()
+                return response
+            except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPStatusError):
+                continue
+        return None
+
+    def _normalize_image_url(self, url: str) -> str:
+        stripped = url.split("?", 1)[0]
+        if "!" in stripped:
+            stripped = stripped.split("!", 1)[0]
+        return stripped
+
+    def _select_images_for_article(
+        self,
+        *,
+        images: list[dict],
+        article_context: dict,
+        max_images: int,
+    ) -> list[dict]:
+        deduped: list[dict] = []
+        seen_urls: set[str] = set()
+        for image in images:
+            if not isinstance(image, dict):
+                continue
+            image_url = str(image.get("image_url") or "")
+            if not image_url:
+                continue
+            normalized = self._normalize_image_url(image_url)
+            if normalized in seen_urls:
+                continue
+            seen_urls.add(normalized)
+            deduped.append({**image, "image_url": image_url})
+
+        if not deduped:
+            return []
+
+        preferred_tags = self._preferred_tags(article_context)
+        tag_limits = {
+            preferred_tags[0]: 3 if preferred_tags else 2,
+            preferred_tags[1]: 3 if len(preferred_tags) > 1 else 2,
+            "food": 2,
+            "landmark": 2,
+            "street_scene": 2,
+            "nature": 2,
+            "night_view": 1,
+            "transport": 1,
+            "hotel": 1,
+        }
+        note_limits: dict[int, int] = {}
+        tag_counts: dict[str, int] = {}
+        selected: list[dict] = []
+
+        sorted_candidates = sorted(
+            deduped,
+            key=lambda item: (
+                self._image_priority(item, preferred_tags),
+                item.get("note_index", 999),
+                item.get("image_index", 999),
+            ),
+        )
+
+        for image in sorted_candidates:
+            tag = str(image.get("tag") or "")
+            note_index = int(image.get("note_index") or 0)
+            if note_limits.get(note_index, 0) >= 4:
+                continue
+            if tag_counts.get(tag, 0) >= tag_limits.get(tag, 2):
+                continue
+            selected.append(image)
+            note_limits[note_index] = note_limits.get(note_index, 0) + 1
+            tag_counts[tag] = tag_counts.get(tag, 0) + 1
+            if len(selected) >= max_images:
+                break
+
+        if len(selected) < min(6, len(deduped)):
+            selected_urls = {self._normalize_image_url(str(item.get("image_url") or "")) for item in selected}
+            for image in deduped:
+                normalized = self._normalize_image_url(str(image.get("image_url") or ""))
+                if normalized in selected_urls:
+                    continue
+                selected.append(image)
+                selected_urls.add(normalized)
+                if len(selected) >= max_images:
+                    break
+
+        return selected
+
+    def _preferred_tags(self, article_context: dict) -> list[str]:
+        text = f"{article_context.get('title', '')} {article_context.get('summary', '')}".lower()
+        ordered: list[str] = []
+        for tag, keywords in self.tag_keywords.items():
+            if any(keyword.lower() in text for keyword in keywords):
+                ordered.append(tag)
+        defaults = ["landmark", "street_scene", "nature", "food"]
+        for item in defaults:
+            if item not in ordered:
+                ordered.append(item)
+        return ordered
+
+    def _image_priority(self, image: dict, preferred_tags: list[str]) -> tuple[int, int, int]:
+        tag = str(image.get("tag") or "")
+        tag_rank = preferred_tags.index(tag) if tag in preferred_tags else len(preferred_tags) + 5
+        note_index = int(image.get("note_index") or 99)
+        image_index = int(image.get("image_index") or 99)
+        return (tag_rank, note_index, image_index)
+
 
 class XiaohongshuMcpProvider:
     provider_name = "xiaohongshu-mcp"
@@ -821,13 +951,17 @@ class XiaohongshuMcpProvider:
             mcp_config=mcp_config,
         )
         assets: list[GeneratedAsset] = []
-        with httpx.Client(timeout=30, follow_redirects=True, headers=self._headers()) as client:
+        note_count = int(preview.get("note_count") or 0)
+        raw_image_count = int(preview.get("raw_image_count") or preview.get("image_count") or 0)
+        selected_image_count = int(preview.get("image_count") or 0)
+        with httpx.Client(timeout=20, follow_redirects=True, headers=self._headers()) as client:
             for index, image in enumerate(preview.get("images", [])[:10], start=1):
                 image_url = str(image.get("image_url") or "")
                 if not image_url:
                     continue
-                response = client.get(image_url)
-                response.raise_for_status()
+                response = self._download_image_with_retry(client, image_url)
+                if response is None:
+                    continue
                 tag = str(image.get("tag") or "landmark")
                 suffix = self._infer_suffix(str(response.url))
                 image_path = images_dir / f"asset_{index:02d}_{tag}{suffix}"
@@ -846,6 +980,9 @@ class XiaohongshuMcpProvider:
                             "kind": "xiaohongshu_mcp_image",
                             "caption_hint": f"{destination} {tag} 小红书 MCP 素材",
                             "note_index": image.get("note_index", 0),
+                            "provider_note_count": note_count,
+                            "provider_raw_image_count": raw_image_count,
+                            "provider_selected_image_count": selected_image_count,
                         },
                     )
                 )
@@ -875,17 +1012,29 @@ class XiaohongshuMcpProvider:
         notes = self._extract_notes(search_result)
         flattened_images: list[dict] = []
         normalized_notes: list[dict] = []
+        raw_image_target = max(10, limit * 3)
         for note_index, note in enumerate(notes[:limit], start=1):
-            detail_result = client.get_note_detail(note)
+            try:
+                detail_result = client.get_note_detail(note)
+            except Exception:
+                continue
             payload = self._normalize_note_detail(note, detail_result, note_index)
             normalized_notes.append(payload)
             flattened_images.extend(payload["images"])
+            if len(flattened_images) >= raw_image_target:
+                break
+        selected_images = self._select_images_for_article(
+            images=flattened_images,
+            article_context=article_context,
+            max_images=max(limit * 6, 10),
+        )
         return {
             "provider": self.provider_name,
             "discovery_mode": True,
             "seed_count": len(notes[:limit]),
             "note_count": len(normalized_notes),
-            "image_count": len(flattened_images),
+            "image_count": len(selected_images),
+            "raw_image_count": len(flattened_images),
             "browser_diagnostics": {
                 "enabled": True,
                 "attempted": True,
@@ -902,8 +1051,22 @@ class XiaohongshuMcpProvider:
                 else [],
             },
             "notes": normalized_notes,
-            "images": flattened_images,
+            "images": selected_images,
         }
+
+    def _download_image_with_retry(
+        self,
+        client: httpx.Client,
+        image_url: str,
+    ) -> httpx.Response | None:
+        for attempt in range(1, 4):
+            try:
+                response = client.get(image_url, timeout=12 + attempt * 4)
+                response.raise_for_status()
+                return response
+            except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPStatusError):
+                continue
+        return None
 
     def _extract_notes(self, search_result: dict) -> list[dict]:
         structured = search_result.get("structured")
@@ -1046,6 +1209,106 @@ class XiaohongshuMcpProvider:
     def _infer_suffix(self, url: str) -> str:
         return XiaohongshuNoteScrapeProvider()._infer_suffix(url)
 
+    def _normalize_image_url(self, url: str) -> str:
+        stripped = url.split("?", 1)[0]
+        if "!" in stripped:
+            stripped = stripped.split("!", 1)[0]
+        return stripped
+
+    def _select_images_for_article(
+        self,
+        *,
+        images: list[dict],
+        article_context: dict,
+        max_images: int,
+    ) -> list[dict]:
+        deduped: list[dict] = []
+        seen_urls: set[str] = set()
+        for image in images:
+            if not isinstance(image, dict):
+                continue
+            image_url = str(image.get("image_url") or "")
+            if not image_url:
+                continue
+            normalized = self._normalize_image_url(image_url)
+            if normalized in seen_urls:
+                continue
+            seen_urls.add(normalized)
+            deduped.append({**image, "image_url": image_url})
+
+        if not deduped:
+            return []
+
+        preferred_tags = self._preferred_tags(article_context)
+        tag_limits = {
+            preferred_tags[0]: 3 if preferred_tags else 2,
+            preferred_tags[1]: 3 if len(preferred_tags) > 1 else 2,
+            "food": 2,
+            "landmark": 2,
+            "street_scene": 2,
+            "nature": 2,
+            "night_view": 1,
+            "transport": 1,
+            "hotel": 1,
+        }
+        note_limits: dict[int, int] = {}
+        tag_counts: dict[str, int] = {}
+        selected: list[dict] = []
+
+        sorted_candidates = sorted(
+            deduped,
+            key=lambda item: (
+                self._image_priority(item, preferred_tags),
+                item.get("note_index", 999),
+                item.get("image_index", 999),
+            ),
+        )
+
+        for image in sorted_candidates:
+            tag = str(image.get("tag") or "")
+            note_index = int(image.get("note_index") or 0)
+            if note_limits.get(note_index, 0) >= 4:
+                continue
+            if tag_counts.get(tag, 0) >= tag_limits.get(tag, 2):
+                continue
+            selected.append(image)
+            note_limits[note_index] = note_limits.get(note_index, 0) + 1
+            tag_counts[tag] = tag_counts.get(tag, 0) + 1
+            if len(selected) >= max_images:
+                break
+
+        if len(selected) < min(6, len(deduped)):
+            selected_urls = {self._normalize_image_url(str(item.get("image_url") or "")) for item in selected}
+            for image in deduped:
+                normalized = self._normalize_image_url(str(image.get("image_url") or ""))
+                if normalized in selected_urls:
+                    continue
+                selected.append(image)
+                selected_urls.add(normalized)
+                if len(selected) >= max_images:
+                    break
+
+        return selected
+
+    def _preferred_tags(self, article_context: dict) -> list[str]:
+        text = f"{article_context.get('title', '')} {article_context.get('summary', '')}".lower()
+        ordered: list[str] = []
+        for tag, keywords in XiaohongshuNoteScrapeProvider.tag_keywords.items():
+            if any(keyword.lower() in text for keyword in keywords):
+                ordered.append(tag)
+        defaults = ["landmark", "street_scene", "nature", "food"]
+        for item in defaults:
+            if item not in ordered:
+                ordered.append(item)
+        return ordered
+
+    def _image_priority(self, image: dict, preferred_tags: list[str]) -> tuple[int, int, int]:
+        tag = str(image.get("tag") or "")
+        tag_rank = preferred_tags.index(tag) if tag in preferred_tags else len(preferred_tags) + 5
+        note_index = int(image.get("note_index") or 99)
+        image_index = int(image.get("image_index") or 99)
+        return (tag_rank, note_index, image_index)
+
 
 class ImagePipelineService:
     providers: dict[str, ImageSourceProvider] = {
@@ -1106,23 +1369,53 @@ class ImagePipelineService:
                 manifest=app_settings_service.get_external_image_manifest(session),
             )
         elif provider_name == XiaohongshuNoteScrapeProvider.provider_name:
-            generated = provider.collect(
-                article_job_id=article_job_id,
-                destination=destination,
-                article_context=article_context,
-                images_dir=images_dir,
-                job_dir=job_dir,
-                seed_urls=app_settings_service.get_xiaohongshu_seed_urls(session),
-            )
+            try:
+                generated = provider.collect(
+                    article_job_id=article_job_id,
+                    destination=destination,
+                    article_context=article_context,
+                    images_dir=images_dir,
+                    job_dir=job_dir,
+                    seed_urls=app_settings_service.get_xiaohongshu_seed_urls(session),
+                )
+                if not generated:
+                    raise RuntimeError("No note-scrape images collected")
+            except Exception as exc:
+                fallback_provider = self.providers[MockXiaohongshuSvgProvider.provider_name]
+                generated = fallback_provider.collect(
+                    article_job_id=article_job_id,
+                    destination=destination,
+                    article_context=article_context,
+                    images_dir=images_dir,
+                    job_dir=job_dir,
+                )
+                for asset in generated:
+                    asset.metadata["fallback_from"] = XiaohongshuNoteScrapeProvider.provider_name
+                    asset.metadata["fallback_reason"] = str(exc)
         elif provider_name == XiaohongshuMcpProvider.provider_name:
-            generated = provider.collect(
-                article_job_id=article_job_id,
-                destination=destination,
-                article_context=article_context,
-                images_dir=images_dir,
-                job_dir=job_dir,
-                mcp_config=xiaohongshu_mcp_config,
-            )
+            try:
+                generated = provider.collect(
+                    article_job_id=article_job_id,
+                    destination=destination,
+                    article_context=article_context,
+                    images_dir=images_dir,
+                    job_dir=job_dir,
+                    mcp_config=xiaohongshu_mcp_config,
+                )
+                if not generated:
+                    raise RuntimeError("No MCP images collected")
+            except Exception as exc:
+                fallback_provider = self.providers[MockXiaohongshuSvgProvider.provider_name]
+                generated = fallback_provider.collect(
+                    article_job_id=article_job_id,
+                    destination=destination,
+                    article_context=article_context,
+                    images_dir=images_dir,
+                    job_dir=job_dir,
+                )
+                for asset in generated:
+                    asset.metadata["fallback_from"] = XiaohongshuMcpProvider.provider_name
+                    asset.metadata["fallback_reason"] = str(exc)
         else:
             generated = provider.collect(
                 article_job_id=article_job_id,
@@ -1163,7 +1456,22 @@ class ImagePipelineService:
                     "layout": "magazine-freeform",
                     "source_count": min(6, len(generated)),
                     "format": "svg",
-                        "provider": provider.provider_name,
+                    "provider": provider.provider_name,
+                    "note_count": (
+                        int(generated[0].metadata.get("provider_note_count", 0))
+                        if generated
+                        else 0
+                    ),
+                    "raw_image_count": (
+                        int(generated[0].metadata.get("provider_raw_image_count", len(generated)))
+                        if generated
+                        else 0
+                    ),
+                    "selected_image_count": (
+                        int(generated[0].metadata.get("provider_selected_image_count", len(generated)))
+                        if generated
+                        else len(generated)
+                    ),
                 },
                 ensure_ascii=False,
             ),
@@ -1286,6 +1594,16 @@ class ImagePipelineService:
                 else settings.image_source_provider
             ),
             "image_count": len(image_assets),
+            "raw_image_count": (
+                json.loads(collage.metadata_json or "{}").get("raw_image_count", len(image_assets))
+                if collage
+                else len(image_assets)
+            ),
+            "note_count": (
+                json.loads(collage.metadata_json or "{}").get("note_count", 0)
+                if collage
+                else 0
+            ),
             "images": [
                 {
                     "id": asset.id,

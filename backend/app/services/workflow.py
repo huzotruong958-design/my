@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime, timedelta
 import json
+from contextlib import suppress
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from sqlmodel import Session, select
 
+from app.db.session import engine
 from app.agents.prompts import AGENT_PROMPTS
 from app.integrations.search import search_service
 from app.integrations.wechat import wechat_integration
@@ -23,6 +27,7 @@ from app.services.app_settings import app_settings_service
 from app.services.image_pipeline import image_pipeline_service
 from app.services.llm_runtime import llm_runtime
 from app.services.model_router import model_router
+from app.services.secrets import secrets_service
 
 
 class WorkflowState(TypedDict, total=False):
@@ -35,6 +40,10 @@ class WorkflowState(TypedDict, total=False):
     destination: str
     season_theme: str
     search_preview: dict
+    content_strategy_config: dict
+    recent_destinations: list[str]
+    auto_blacklist: list[str]
+    duplicate_destination_feedback: str
     researcher: dict
     fact_checker: dict
     writer: dict
@@ -55,6 +64,9 @@ class WorkflowService:
         "publisher",
     ]
 
+    def __init__(self) -> None:
+        self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="workflow")
+
     def create_job(self, session: Session, payload: TravelRequest) -> ArticleJob:
         job = ArticleJob(
             tenant_id=payload.tenant_id,
@@ -71,7 +83,51 @@ class WorkflowService:
 
     def probe_agent(self, session: Session, tenant_id: int, agent_type: str, state: dict) -> dict:
         model_info = model_router.resolve(session, tenant_id, agent_type)
-        return self._execute_agent(agent_type, state, model_info)
+        enriched_state = dict(state)
+        config = app_settings_service.get_content_strategy_config(session)
+        enriched_state.setdefault("content_strategy_config", config)
+        enriched_state.setdefault(
+            "recent_destinations",
+            app_settings_service.get_recent_destinations(
+                session,
+                months=int(config.get("no_repeat_months") or 3),
+            ),
+        )
+        enriched_state.setdefault(
+            "auto_blacklist",
+            app_settings_service.get_auto_destination_blacklist(session),
+        )
+        return self._execute_agent(agent_type, enriched_state, model_info)
+
+    def run_job_by_id(self, article_job_id: int) -> ArticleJob | None:
+        with Session(engine) as session:
+            job = session.get(ArticleJob, article_job_id)
+            if not job:
+                return None
+            return self.run_job(session, job)
+
+    def submit_job_by_id(self, article_job_id: int) -> Future[ArticleJob | None]:
+        return self._executor.submit(self.run_job_by_id, article_job_id)
+
+    def reconcile_stale_running_jobs(self, *, max_age_minutes: int = 30) -> int:
+        cutoff = datetime.utcnow() - timedelta(minutes=max_age_minutes)
+        updated = 0
+        with Session(engine) as session:
+            stale_jobs = session.exec(
+                select(ArticleJob).where(
+                    ArticleJob.status == JobStatus.running,
+                    ArticleJob.created_at < cutoff,
+                )
+            ).all()
+            for job in stale_jobs:
+                job.status = JobStatus.failed
+                if not job.error_message:
+                    job.error_message = "Marked failed during startup reconciliation for stale running job."
+                session.add(job)
+                updated += 1
+            if updated:
+                session.commit()
+        return updated
 
     def run_job(self, session: Session, job: ArticleJob) -> ArticleJob:
         account = session.get(OfficialAccount, job.official_account_id)
@@ -96,14 +152,40 @@ class WorkflowService:
             "destination": "待定目的地",
             "season_theme": self._season_theme(job.start_date),
             "search_preview": search_service.preview("待定目的地", "destination_overview"),
+            "content_strategy_config": app_settings_service.get_content_strategy_config(session),
         }
+        initial_state["recent_destinations"] = app_settings_service.get_recent_destinations(
+            session,
+            months=int(initial_state["content_strategy_config"].get("no_repeat_months") or 3),
+        )
+        initial_state["auto_blacklist"] = app_settings_service.get_auto_destination_blacklist(session)
 
-        graph = self._build_graph(session, job)
-        final_state = graph.invoke(initial_state)
-
-        job.destination = final_state["destination"]
-        job.status = JobStatus.succeeded
-        job.output_json = json.dumps(final_state, ensure_ascii=False)
+        try:
+            graph = self._build_graph(session, job)
+            final_state = graph.invoke(initial_state)
+            job.destination = final_state.get("destination", job.destination)
+            job.status = JobStatus.succeeded
+            job.output_json = json.dumps(final_state, ensure_ascii=False)
+            if job.destination:
+                app_settings_service.record_selected_destination(
+                    session,
+                    destination=job.destination,
+                    job_id=job.id,
+                )
+        except Exception as exc:
+            job.status = JobStatus.failed
+            job.error_message = str(exc)
+            with suppress(Exception):
+                partial_steps = session.exec(
+                    select(JobStep).where(JobStep.article_job_id == job.id).order_by(JobStep.id.asc())
+                ).all()
+                partial_output = {
+                    step.agent_name: json.loads(step.output_json or "{}")
+                    for step in partial_steps
+                    if step.output_json
+                }
+                if partial_output:
+                    job.output_json = json.dumps(partial_output, ensure_ascii=False)
         session.add(job)
         session.commit()
         session.refresh(job)
@@ -124,103 +206,178 @@ class WorkflowService:
     def _make_node(self, step_name: str, session: Session, job: ArticleJob):
         def node(state: WorkflowState) -> WorkflowState:
             model_info = model_router.resolve(session, job.tenant_id, step_name)
-            output = self._execute_agent(step_name, state, model_info)
+            try:
+                execution_state = dict(state)
+                output = self._execute_agent(step_name, execution_state, model_info)
 
-            updated: WorkflowState = {step_name: output}
-            if step_name == "researcher":
-                updated["destination"] = output["result"]["destination"]
-            if step_name == "image_editor":
-                image_pack = image_pipeline_service.collect_for_job(
-                    session=session,
-                    article_job_id=job.id or 0,
-                    official_account_id=job.official_account_id,
-                    destination=state.get("destination", "待定目的地"),
-                    article_context={
-                        "title": state.get("editor", {}).get("result", {}).get("final_title", ""),
-                        "summary": state.get("editor", {}).get("result", {}).get("summary", ""),
-                    },
-                )
-                output["result"]["image_asset_pack"] = image_pack
-                output["result"]["provider_context"] = {
-                    "provider": image_pack.get("provider", ""),
-                    "manifest_count": len(app_settings_service.get_external_image_manifest(session)),
-                }
-                slot_plan = output["result"].get("slot_plan", [])
-                images = image_pack.get("images", []) if isinstance(image_pack, dict) else []
-                output["result"]["slot_assignments"] = self._assign_images_to_slots(slot_plan, images)
-            if step_name == "publisher":
-                auth = session.exec(
-                    select(WeChatAuthorization).where(
-                        WeChatAuthorization.official_account_id == job.official_account_id
+                updated: WorkflowState = {step_name: output}
+                if step_name == "researcher":
+                    output = self._retry_researcher_if_repeated(
+                        session=session,
+                        job=job,
+                        state=execution_state,
+                        model_info=model_info,
+                        output=output,
                     )
-                ).first()
-                authorizer_access_token = (
-                    auth.authorizer_access_token if auth and auth.authorizer_access_token else "mock-authorizer-access-token"
-                )
-                publish_payload = self._build_publish_payload(state)
-                publish_preview = self.build_publish_preview(
-                    official_account_id=job.official_account_id,
-                    publish_payload=publish_payload,
-                    auth=auth,
-                    publish_readiness={
-                        "publish_ready": output["result"].get("publish_ready"),
-                        "missing_assets": output["result"].get("missing_assets", []),
-                        "dry_run_recommended": output["result"].get("dry_run_recommended"),
-                        "authorization_mode_hint": output["result"].get("authorization_mode_hint"),
-                        "required_actions": output["result"].get("required_actions", []),
-                    },
-                    authorizer_access_token=authorizer_access_token,
-                )
-                output["result"]["publish_preview"] = publish_preview
-                publish = self._execute_publish(
-                    official_account_id=job.official_account_id,
-                    publish_payload=publish_payload,
-                    authorizer_access_token=authorizer_access_token,
-                    authorization_mode=publish_preview["authorization_mode"],
-                )
-                self._sync_media_assets_after_publish(
-                    session=session,
-                    article_job_id=job.id or 0,
-                    publish_result=publish,
-                )
-                output["result"]["publish_response"] = publish
-                session.add(
-                    PublishRecord(
-                        article_job_id=job.id,
+                    updated[step_name] = output
+                    updated["destination"] = output["result"]["destination"]
+                if step_name == "image_editor":
+                    image_pack = image_pipeline_service.collect_for_job(
+                        session=session,
+                        article_job_id=job.id or 0,
                         official_account_id=job.official_account_id,
-                        authorization_mode=publish.get("authorization_mode", authorization_mode),
-                        draft_id=publish["draft_id"],
-                        cover_media_id=publish["cover_media_id"],
-                        thumb_result_json=json.dumps(
-                            publish.get("thumb_result") or {},
-                            ensure_ascii=False,
-                        ),
-                        upload_results_json=json.dumps(
-                            publish.get("upload_results") or [],
-                            ensure_ascii=False,
-                        ),
-                        draft_response_json=json.dumps(
-                            publish.get("draft_response") or {},
-                            ensure_ascii=False,
-                        ),
-                        content_media_ids=json.dumps(publish["content_media_ids"]),
-                        raw_response=json.dumps(publish, ensure_ascii=False),
+                        destination=state.get("destination", "待定目的地"),
+                        article_context={
+                            "title": state.get("editor", {}).get("result", {}).get("final_title", ""),
+                            "summary": state.get("editor", {}).get("result", {}).get("summary", ""),
+                        },
+                    )
+                    output["result"]["image_asset_pack"] = image_pack
+                    output["result"]["provider_context"] = {
+                        "provider": image_pack.get("provider", ""),
+                        "image_count": image_pack.get("image_count", 0),
+                        "raw_image_count": image_pack.get("raw_image_count", image_pack.get("image_count", 0)),
+                        "source_note_count": image_pack.get("note_count", 0),
+                    }
+                    slot_plan = output["result"].get("slot_plan", [])
+                    images = image_pack.get("images", []) if isinstance(image_pack, dict) else []
+                    output["result"]["slot_assignments"] = self._assign_images_to_slots(slot_plan, images)
+                if step_name == "publisher":
+                    auth = session.exec(
+                        select(WeChatAuthorization).where(
+                            WeChatAuthorization.official_account_id == job.official_account_id
+                        )
+                    ).first()
+                    authorizer_access_token = (
+                        secrets_service.decrypt_if_needed(auth.authorizer_access_token)
+                        if auth and auth.authorizer_access_token
+                        else "mock-authorizer-access-token"
+                    )
+                    publish_payload = self._build_publish_payload(state)
+                    publish_preview = self.build_publish_preview(
+                        official_account_id=job.official_account_id,
+                        publish_payload=publish_payload,
+                        auth=auth,
+                        publish_readiness={
+                            "publish_ready": output["result"].get("publish_ready"),
+                            "missing_assets": output["result"].get("missing_assets", []),
+                            "dry_run_recommended": output["result"].get("dry_run_recommended"),
+                            "authorization_mode_hint": output["result"].get("authorization_mode_hint"),
+                            "required_actions": output["result"].get("required_actions", []),
+                        },
+                        authorizer_access_token=authorizer_access_token,
+                    )
+                    authorization_mode = publish_preview["authorization_mode"]
+                    output["result"]["publish_preview"] = publish_preview
+                    publish = self._execute_publish(
+                        official_account_id=job.official_account_id,
+                        publish_payload=publish_payload,
+                        authorizer_access_token=authorizer_access_token,
+                        authorization_mode=authorization_mode,
+                    )
+                    self._sync_media_assets_after_publish(
+                        session=session,
+                        article_job_id=job.id or 0,
+                        publish_result=publish,
+                    )
+                    output["result"]["publish_response"] = publish
+                    session.add(
+                        PublishRecord(
+                            article_job_id=job.id,
+                            official_account_id=job.official_account_id,
+                            authorization_mode=publish.get("authorization_mode", authorization_mode),
+                            draft_id=publish["draft_id"],
+                            cover_media_id=publish["cover_media_id"],
+                            thumb_result_json=json.dumps(
+                                publish.get("thumb_result") or {},
+                                ensure_ascii=False,
+                            ),
+                            upload_results_json=json.dumps(
+                                publish.get("upload_results") or [],
+                                ensure_ascii=False,
+                            ),
+                            draft_response_json=json.dumps(
+                                publish.get("draft_response") or {},
+                                ensure_ascii=False,
+                            ),
+                            content_media_ids=json.dumps(publish["content_media_ids"]),
+                            raw_response=json.dumps(publish, ensure_ascii=False),
+                        )
+                    )
+                session.add(
+                    JobStep(
+                        article_job_id=job.id,
+                        agent_name=step_name,
+                        status="succeeded",
+                        model_provider=model_info["provider"],
+                        model_name=model_info["model_name"],
+                        output_json=json.dumps(output, ensure_ascii=False),
                     )
                 )
-            session.add(
-                JobStep(
-                    article_job_id=job.id,
-                    agent_name=step_name,
-                    status="succeeded",
-                    model_provider=model_info["provider"],
-                    model_name=model_info["model_name"],
-                    output_json=json.dumps(output, ensure_ascii=False),
+                session.commit()
+                return updated
+            except Exception as exc:
+                failed_output = {
+                    "goal": f"Execute {step_name} for article job {job.id}",
+                    "input_summary": f"Account={state.get('account_name', '')}",
+                    "decision": "Step failed",
+                    "result": {},
+                    "risk_flags": [str(exc)],
+                    "retryable": True,
+                    "execution_mode": "failed",
+                }
+                session.add(
+                    JobStep(
+                        article_job_id=job.id,
+                        agent_name=step_name,
+                        status="failed",
+                        model_provider=model_info["provider"],
+                        model_name=model_info["model_name"],
+                        output_json=json.dumps(failed_output, ensure_ascii=False),
+                    )
                 )
-            )
-            session.commit()
-            return updated
+                session.commit()
+                raise
 
         return node
+
+    def _retry_researcher_if_repeated(
+        self,
+        *,
+        session: Session,
+        job: ArticleJob,
+        state: dict,
+        model_info: dict,
+        output: dict,
+    ) -> dict:
+        recent_destinations = {
+            str(item).strip().casefold()
+            for item in state.get("recent_destinations", [])
+            if str(item).strip()
+        }
+        destination = str(output.get("result", {}).get("destination") or "").strip()
+        if not destination or destination.casefold() not in recent_destinations:
+            return output
+
+        retry_state = {
+            **state,
+            "duplicate_destination_feedback": (
+                f"目的地 {destination} 已在最近"
+                f"{state.get('content_strategy_config', {}).get('no_repeat_months', 3)} 个月内使用过，必须换一个。"
+            ),
+        }
+        retry_output = self._execute_agent("researcher", retry_state, model_info)
+        retry_destination = str(retry_output.get("result", {}).get("destination") or "").strip()
+        if retry_destination and retry_destination.casefold() not in recent_destinations:
+            retry_output.setdefault("risk_flags", [])
+            retry_output["risk_flags"] = [
+                *retry_output.get("risk_flags", []),
+                f"replaced_repeated_destination:{destination}",
+            ]
+            return retry_output
+        raise RuntimeError(
+            f"Researcher selected repeated destination within cooldown window: {destination}"
+        )
 
     def build_authorization_context(self, auth: WeChatAuthorization | None) -> dict:
         authorization_mode = self._authorization_mode(auth)
@@ -242,7 +399,9 @@ class WorkflowService:
     ) -> dict:
         authorization_context = self.build_authorization_context(auth)
         access_token = authorizer_access_token or (
-            auth.authorizer_access_token if auth and auth.authorizer_access_token else "mock-authorizer-access-token"
+            secrets_service.decrypt_if_needed(auth.authorizer_access_token)
+            if auth and auth.authorizer_access_token
+            else "mock-authorizer-access-token"
         )
         publish_bundle = wechat_integration.build_publish_bundle(access_token, publish_payload)
         return {
@@ -307,8 +466,9 @@ class WorkflowService:
     def _authorization_mode(self, auth: WeChatAuthorization | None) -> str:
         if not auth:
             return "missing"
-        raw_payload = auth.raw_payload or ""
-        if "mock-authorize" in raw_payload or auth.authorizer_access_token.startswith("mock-"):
+        raw_payload = secrets_service.decrypt_if_needed(auth.raw_payload)
+        access_token = secrets_service.decrypt_if_needed(auth.authorizer_access_token)
+        if "mock-authorize" in raw_payload or access_token.startswith("mock-"):
             return "mock"
         return "third_party_platform"
 

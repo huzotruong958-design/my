@@ -2,6 +2,7 @@ import {
   JobDetail,
 } from "@/components/job-detail-types";
 import { JobArticleSection } from "@/components/job-article-section";
+import { JobDetailAutoRefresh } from "@/components/job-detail-auto-refresh";
 import { apiGet } from "@/lib/api";
 import { JobImageSection } from "@/components/job-image-section";
 import { JobMergedStateSection } from "@/components/job-merged-state-section";
@@ -22,7 +23,7 @@ export default async function JobDetailPage({
     resolveParsedOutputs(detail.parsed_output);
 
   return (
-    <div className="stack">
+    <JobDetailAutoRefresh status={detail.job.status}>
       <div className="hero">
         <div className="eyebrow">Job Detail</div>
         <h1 style={{ margin: 0 }}>
@@ -63,6 +64,6 @@ export default async function JobDetailPage({
       <PublishExecutePanel jobId={detail.job.id} />
 
       <JobMergedStateSection parsedOutput={detail.parsed_output} />
-    </div>
+    </JobDetailAutoRefresh>
   );
 }

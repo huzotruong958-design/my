@@ -5,15 +5,16 @@ import json
 from sqlmodel import Session, select
 
 from app.models.entities import AgentModelConfig, ModelCredential
+from app.services.secrets import secrets_service
 
 
 DEFAULT_AGENT_MODELS = {
-    "researcher": {"provider": "gemini", "model_name": "gemini-2.5-pro"},
-    "fact_checker": {"provider": "openai-compatible", "model_name": "gpt-4.1-mini"},
-    "writer": {"provider": "gemini", "model_name": "gemini-2.5-pro"},
-    "formatter": {"provider": "anthropic", "model_name": "claude-3-7-sonnet"},
-    "editor": {"provider": "openai-compatible", "model_name": "gpt-4.1-mini"},
-    "image_editor": {"provider": "gemini", "model_name": "gemini-2.5-pro"},
+    "researcher": {"provider": "gemini", "model_name": "gemini-3-flash-preview"},
+    "fact_checker": {"provider": "gemini", "model_name": "gemini-3-flash-preview"},
+    "writer": {"provider": "gemini", "model_name": "gemini-3-pro-preview"},
+    "formatter": {"provider": "gemini", "model_name": "gemini-3-flash-preview"},
+    "editor": {"provider": "gemini", "model_name": "gemini-3-flash-preview"},
+    "image_editor": {"provider": "gemini", "model_name": "gemini-3-flash-preview"},
     "publisher": {"provider": "system", "model_name": "workflow"},
 }
 
@@ -48,7 +49,7 @@ class ModelRouter:
                 "id": credential.id,
                 "label": credential.label,
                 "base_url": credential.base_url,
-                "api_key": credential.api_key_encrypted,
+                "api_key": secrets_service.decrypt_if_needed(credential.api_key_encrypted),
             }
             if credential
             else None,
